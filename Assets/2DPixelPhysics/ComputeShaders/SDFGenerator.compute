@@ -1,0 +1,68 @@
+// Each #kernel tells which function to compile; you can have many kernels
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float2> Result;
+Texture2D<float4> Texture;
+int stepSize;
+int2 size;
+#pragma kernel Init
+[numthreads(8,8,1)]
+void Init(uint3 id : SV_DispatchThreadID)
+{
+    bool p = Texture[id.xy].a != 0;
+    bool l = Texture[id.xy-int2(1,0)].a != 0;
+    bool r = Texture[id.xy+int2(1,0)].a != 0;
+    bool u = Texture[id.xy-int2(0,1)].a != 0;
+    bool d = Texture[id.xy+int2(0,1)].a != 0;
+    if (!p)
+    {
+        Result[id.xy] = float2(-1,-1);
+    }
+    else
+    {
+        if (!l||!r||!u||!d)
+            Result[id.xy]=float2(id.xy)/size;
+        else
+            Result[id.xy] = float2(-1,-1);
+    }
+}
+
+#pragma kernel JFAPass
+[numthreads(8,8,1)]
+void JFAPass(uint3 id : SV_DispatchThreadID) {
+    float2 best = Result[id.xy];
+    float2 pos = (float2)id.xy/size;
+    float bestDist = (best.x < 0) ? 1e20 : distance(best, pos);
+
+    for(int ox=-1; ox<=1; ox++) {
+        for(int oy=-1; oy<=1; oy++) {
+            int2 n = id.xy + int2(ox, oy) * stepSize;
+            if (n.x < 0 || n.y < 0 || n.x >= size.x || n.y >= size.y) continue;
+
+            float2 candidate = Result[n];
+            if (candidate.x < 0) continue;
+
+            float d = distance(candidate, pos);
+            if(d < bestDist) {
+                bestDist = d;
+                best = candidate;
+            }
+        }
+    }
+    Result[id.xy] = best;
+}
+#pragma kernel JFAToSDF
+[numthreads(8,8,1)]
+void JFAToSDF(uint3 id : SV_DispatchThreadID)
+{
+    float2 pos = (float2)id.xy/size;
+    if (Texture[id.xy].a != 0)
+    {
+        Result[id.xy] = -distance(pos, Result[id.xy]);
+    }
+    else
+    {
+        Result[id.xy] = distance(pos, Result[id.xy]);
+    }
+}

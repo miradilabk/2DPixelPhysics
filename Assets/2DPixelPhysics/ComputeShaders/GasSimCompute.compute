@@ -1,0 +1,207 @@
+//xy: velocity, z:pressure
+RWTexture2D<float3> Gas;
+RWTexture2D<float3> BufferGas;
+RWTexture2D<float4> SmokeMap;
+Texture2D<float> fluidMap;
+Texture2D<float> pixelsMap;
+RWTexture2D<uint> BoundaryMap;
+float gridSize;
+uint2 size;
+float overRelaxFactor;
+float dt;
+uint redOrBlack;
+#define left int2(-1,0)
+#define right int2(1,0)
+#define up int2(0, 1)
+#define down int2(0, -1)
+#define canFlow(pos) ((BoundaryMap[pos]))
+
+uint2 smokePos;
+float smokeRadius;
+float4 smokeColor;
+
+float2 rand_2_05(in float2 uv)
+{
+    float2 noise = (frac(sin(dot(uv ,float2(12.9898,78.233)*2.0)) * 43758.5453));
+    return noise;
+}
+
+#pragma kernel Integrate
+[numthreads(8,8,1)]
+void Integrate (uint2 id : SV_DispatchThreadID)
+{
+    BufferGas[id] = float3(0,0,0);
+    Gas[id] = float3(0,0,0);
+}
+
+#pragma kernel SolveIncompressibility
+[numthreads(8,8,1)]
+void SolveIncompressibility (uint2 id : SV_DispatchThreadID)
+{
+    uint oddOrEven = id.y%2;
+    int offset = (int)((redOrBlack+oddOrEven)%2);
+    int2 coord = int2((int)(id.x)*2+offset, (int)id.y);
+    if (!canFlow(coord)) return;
+    int l = canFlow(coord+left);
+    int r = canFlow(coord+right);
+    int u = canFlow(coord+up);
+    int d = canFlow(coord+down);
+    int s = l+r+u+d;
+    if (s == 0) return;
+    float divergence = Gas[coord+right].x*r-Gas[coord].x +
+        Gas[coord+up].y*u-Gas[coord].y;
+    float pressure = ((Gas[coord+right].z*r+Gas[coord+left].z*l +
+        Gas[coord+up].z*u+Gas[coord+down].z*d)- divergence)/s;
+    float oldPressure = Gas[coord].z;
+    float overPressure = oldPressure + (pressure-oldPressure)*overRelaxFactor;
+    /*if (isnan(Gas[coord].x))
+    {
+        pressure = 0.1;
+    }*/
+    Gas[coord] = float3(Gas[coord].xy, overPressure);
+}
+
+#pragma kernel ProjectVelocity
+[numthreads(8,8,1)]
+void ProjectVelocity(uint2 id : SV_DispatchThreadID)
+{
+    int2 c = (int2)id;
+
+    if (!canFlow(c)) return;
+
+    int l = canFlow(c+left);
+    int r = canFlow(c+right);
+    int u = canFlow(c+up);
+    int d = canFlow(c+down);
+    if (l+r+u+d == 0) return;
+    
+    float pC = Gas[c].z;
+    float pL = Gas[c + left].z;
+    float pD = Gas[c + down].z;
+
+    BufferGas[c] = Gas[c]-float3((pC-pL)*l, (pC-pD)*d, 0);
+}
+
+float3 SampleField(float2 pos, int field)
+{
+    float divGrid = 1.0/gridSize;
+    float halfGridSize = gridSize * 0.5;
+    pos = clamp(pos, gridSize, size*gridSize);
+    float2 d = 0;
+    switch (field)
+    {
+        case 0: d = float2(0,halfGridSize); break;
+        case 1: d = float2(halfGridSize,0); break;
+        case 2: d = float2(halfGridSize,halfGridSize); break;
+    default: break;
+    }
+    uint2 p0 = min(floor((pos-d)*divGrid), size-uint2(1,1));
+    uint2 p1 = min(p0+uint2(1,1), size-uint2(1,1));
+    float2 t = ((pos-d)-p0*gridSize)*divGrid;
+    float2 s = float2(1,1)-t;
+    return s.x*s.y*Gas[p0] +
+        t.x*s.y*Gas[uint2(p1.x,p0.y)] +
+        t.x*t.y*Gas[p1]+
+        s.x*t.y*Gas[uint2(p0.x,p1.y)];
+}
+float4 SampleSmoke(float2 pos)
+{
+    float divGrid = 1.0/gridSize;
+    float halfGridSize = gridSize * 0.5;
+    pos = clamp(pos, gridSize, size*gridSize);
+    float2 d = float2(halfGridSize,halfGridSize);
+    uint2 p0 = min(floor((pos-d)*divGrid), size-uint2(1,1));
+    uint2 p1 = min(p0+uint2(1,1), size-uint2(1,1));
+    float2 t = ((pos-d)-p0*gridSize)*divGrid;
+    float2 s = float2(1,1)-t;
+    return s.x*s.y*SmokeMap[p0] +
+        t.x*s.y*SmokeMap[uint2(p1.x,p0.y)] +
+        t.x*t.y*SmokeMap[p1]+
+        s.x*t.y*SmokeMap[uint2(p0.x,p1.y)];
+}
+#pragma kernel AdvectVelocity
+[numthreads(8,8,1)]
+void AdvectVelocity (uint2 id : SV_DispatchThreadID)
+{
+    int2 coord = (int2)id;
+    
+    BufferGas[coord] = Gas[coord];
+    if (canFlow(coord))
+    {
+        //x vel
+        if (canFlow(coord+left))
+        {
+            float2 pos = coord*gridSize;
+            pos.y += gridSize * 0.5;
+            float2 vel = float2(Gas[coord].x, (Gas[coord+left].y+Gas[coord].y+Gas[coord+int2(-1,1)].y+Gas[coord+up].y)*0.25);
+            pos -= vel * dt;
+            BufferGas[coord] = float3(SampleField(pos, 0).x, BufferGas[coord].yz);
+        }
+        //y vel
+        if (canFlow(coord+down))
+        {
+            float2 pos = coord*gridSize;
+            pos.x += gridSize * 0.5;
+            float2 vel = float2((Gas[coord+down].x+Gas[coord].x+Gas[coord+int2(1,-1)].x+Gas[coord+right].x)*0.25,Gas[coord].y);
+            pos -= vel * dt;
+            BufferGas[coord] = float3(BufferGas[coord].x, SampleField(pos, 1).y, BufferGas[coord].z);
+        }
+    }
+}
+
+#pragma kernel AdvectSmoke
+[numthreads(8,8,1)]
+void AdvectSmoke (uint2 id : SV_DispatchThreadID)
+{
+    int2 coord = (int2)id;
+    if (canFlow(coord))
+    {
+        float2 vel = float2((Gas[coord].x+Gas[coord+right].x)*0.5, (Gas[coord].y+Gas[coord+up].y)*0.5);
+        float2 pos = float2(coord*gridSize+gridSize*0.5-vel*dt);
+        SmokeMap[coord] = SampleSmoke(pos);
+    }
+}
+
+#pragma kernel CopyPressure
+[numthreads(8,8,1)]
+void CopyPressure (uint2 id : SV_DispatchThreadID)
+{
+    Gas[id] = float3(Gas[id].xy, BufferGas[id].z);
+}
+#pragma kernel SetSmoke
+[numthreads(8,8,1)]
+void SetSmoke (uint2 id : SV_DispatchThreadID)
+{
+    int2 coord = (int2)id;
+    int l = canFlow(coord+left);
+    int r = canFlow(coord+right);
+    int u = canFlow(coord+up);
+    int d = canFlow(coord+down);
+    int smoke = distance(id, smokePos) <= smokeRadius ? 1 : 0;
+    if (smoke && l&r&u&d)
+    {
+        Gas[id] += float3(0, 1.5, 0);
+        SmokeMap[id] = smokeColor*2;
+    }
+    else
+    {
+        Gas[id] *= float3(0.99,0.99,1);
+        SmokeMap[id] *= 0.99;
+    }
+}
+
+#pragma kernel CopyBuffer
+[numthreads(8,8,1)]
+void CopyBuffer (uint2 id : SV_DispatchThreadID)
+{
+    Gas[id] = BufferGas[id];
+}
+
+#pragma kernel BuildBoundary
+[numthreads(8,8,1)]
+void BuildBoundary (uint2 id : SV_DispatchThreadID)
+{
+    BoundaryMap[id] = !fluidMap[id] && pixelsMap[id] > 0;
+    if (BoundaryMap[id] ==0)
+        SmokeMap[id] = 0;
+}

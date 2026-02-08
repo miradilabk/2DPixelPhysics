@@ -1,0 +1,66 @@
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Pixels;
+uint2 drawingPixelPos;
+float4 pixelToDraw;
+float time;
+uint2 size;
+//alpha: 7
+float rand_1_05(in float2 uv)
+{
+    float2 noise = (frac(sin(dot(uv +time,float2(12.9898,78.233)*2.0)) * 43758.5453));
+    return abs(noise.x + noise.y) * 0.5;
+}
+#pragma kernel SimulateStep
+[numthreads(8,8,1)]
+void SimulateStep (uint2 id : SV_DispatchThreadID)
+{
+    /*if (id.x == 0 || id.x >= size.x-1 || id.y == 0 ||id.y == size.y-1)
+    {
+        Pixels[id] = float4(1,1,1,-1);
+    }*/
+    if (distance(id, drawingPixelPos) <= 5)
+    {
+        Pixels[id] = float4(pixelToDraw.rgb*(1-rand_1_05((float2)id/float2(320,180))*0.5),pixelToDraw.a);
+    }
+    if (id.y == 0 || Pixels[id].a == 0) return;
+    bool isSand = Pixels[id].a > 0;
+    if (isSand)
+    {
+        if (Pixels[id+int2(0,-1)].a == 0)
+        {
+            Pixels[id+int2(0,-1)] = Pixels[id];
+            Pixels[id] = float4(0,0,0,0);
+        }
+        else
+        {
+            if (rand_1_05(id/float2(320,180)) <= 0.5)
+            {
+                if (id.x >0 && Pixels[id+int2(-1,-1)].a == 0)
+                {
+                    Pixels[id+int2(-1,-1)] = Pixels[id];
+                    Pixels[id] = float4(0,0,0,0);
+                }
+                else if (id.x < 319 && Pixels[id+int2(1,-1)].a == 0)
+                {
+                    Pixels[id+int2(1,-1)] = Pixels[id];
+                    Pixels[id] = float4(0,0,0,0);
+                }
+            }
+            else
+            {
+                if (id.x < 319 && Pixels[id+int2(1,-1)].a == 0)
+                {
+                    Pixels[id+int2(1,-1)] = Pixels[id];
+                    Pixels[id] = float4(0,0,0,0);
+                }
+                else if (id.x > 0 && Pixels[id+int2(-1,-1)].a == 0)
+                {
+                    Pixels[id+int2(-1,-1)] = Pixels[id];
+                    Pixels[id] = float4(0,0,0,0);
+                }
+            }
+        }
+    }
+}

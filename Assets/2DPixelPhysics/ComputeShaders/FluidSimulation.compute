@@ -1,0 +1,498 @@
+// Each #kernel tells which function to compile; you can have many kernels
+
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWStructuredBuffer<float2> positions;
+RWStructuredBuffer<float2> predictions;
+RWStructuredBuffer<float2> velocities;
+RWStructuredBuffer<float2> densities;
+RWStructuredBuffer<float> foamFactors;
+RWStructuredBuffer<uint> startIndices;
+RWStructuredBuffer<uint2> spacialHash;
+RWStructuredBuffer<uint> spacialHashKeys;
+RWStructuredBuffer<uint> liquidTypes;
+RWStructuredBuffer<uint> isLiquidHidden;
+Texture2D<float4> boundaryTexture;
+RWTexture2D<float3> densityMap;
+RWTexture2D<float4> fluidDensityMap;
+Texture2D<float3> densityMapTex;
+SamplerState sampler_LinearClamp : register(s0);
+float delta;
+float predictionStep;
+float smoothRadius;
+uint Prime1;
+uint particleCnt;
+uint gridCount;
+uint2 gridSize;
+uint2 boundaryTextureSize;
+float _sKernel;
+float _sKernelSpiky;
+float _sKernelDerivative;
+float _sKernelSpikyDerivative;
+float _vKernel;
+float targetDensity;
+float pressureMultiplier;
+float nearDensityMultiplier;
+float viscosity;
+float width;
+float height;
+float damping;
+float gravity;
+float2 inputPos;
+float mouseForceStrength;
+float mouseForceRadius;
+float2 obstacleSize;
+float2 obstaclePos;
+uint boundaryParticleCnt;
+float W0;
+float boundaryParticleDist;
+float foamVelocity;
+uint interactState;
+RWStructuredBuffer<uint> spawnBudget;
+#define drag 0
+#define Spawn 1
+
+float2 GetInteractionForce(uint particleIndex)
+{
+    float2 interactionForce = float2(0,0);
+    float2 offset = inputPos - predictions[particleIndex];
+    float sqrDst = dot(offset, offset);
+    if (sqrDst < mouseForceRadius * mouseForceRadius)
+    {
+        float dst = sqrt(sqrDst);
+        if (dst < 0.001) dst = 0.001;
+        float edgeT = dst / mouseForceRadius;
+        float centerT = 1 - edgeT;
+        float2 dirToInput = offset / dst;
+        interactionForce += (dirToInput*mouseForceStrength - velocities[particleIndex]) * centerT;
+    }
+    return interactionForce;
+}
+
+#pragma kernel PredictPositions
+[numthreads(64,1,1)]
+void PredictPositions (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint old;
+
+
+    if (isLiquidHidden[i] && spawnBudget[0] > 0 && mouseForceStrength > 0)
+    {
+        InterlockedAdd(spawnBudget[0], 1, old);
+        if (isLiquidHidden[i] && mouseForceStrength > 0 && old<2)
+        {
+            isLiquidHidden[i] = false;
+            positions[i] = predictions[i] = inputPos;
+            velocities[i] = float2(10,10);
+        }
+    }
+    if (isLiquidHidden[i]) return;
+    if (mouseForceStrength != 0)
+    {
+        if (interactState == drag)
+            velocities[i] += GetInteractionForce(i)/densities[i];
+        else
+        {
+            if (mouseForceStrength < 0)
+            {
+                float2 offset = inputPos - predictions[i];
+                float sqrDst = dot(offset, offset);
+                if (sqrDst < mouseForceRadius * mouseForceRadius)
+                {
+                    isLiquidHidden[i] = true;
+                    //positions[i] = predictions[i] = float2(-1,-1);
+                }
+            }
+        }
+    }
+    velocities[i].y += gravity * delta;
+    predictions[i] = positions[i] + velocities[i]*predictionStep;
+    //predictions[i]=clamp(predictions[i],float2(0,0),float2(width,height));
+}
+
+uint GetGridIndexByPos(float x, float y)
+{
+    uint index = (uint)((x+width) / smoothRadius) + (uint)((y+height) / smoothRadius) * gridSize.x;
+    return index;
+}
+
+uint GetHashByGrid(uint gridPos)
+{
+    return (gridPos)*Prime1 % particleCnt;
+}
+
+uint GetHashByPos(float x, float y)
+{
+    return GetHashByGrid(GetGridIndexByPos(x,y));
+}
+
+float SmoothKernelSpiky(float dst)
+{
+    if (dst >= smoothRadius) return 0.0;
+    float val = pow(smoothRadius-dst, 3)*_sKernelSpiky;
+    return val;
+}
+
+float SmoothKernel(float dst)
+{
+    if (dst >= smoothRadius) return 0.0;
+    float v = (smoothRadius - dst) * (smoothRadius - dst);
+    float val = v*_sKernel;
+    return val;
+}
+
+float2 SDFGradient(float2 uv)
+{
+    const float eps = 0.003125;
+    float dx = boundaryTexture.SampleLevel(sampler_LinearClamp, float2(uv.x+eps,uv.y),0).r -
+        boundaryTexture.SampleLevel(sampler_LinearClamp, float2(uv.x-eps,uv.y),0).r;
+    float dy = boundaryTexture.SampleLevel(sampler_LinearClamp, float2(uv.x,uv.y+eps),0).r -
+        boundaryTexture.SampleLevel(sampler_LinearClamp, float2(uv.x,uv.y-eps),0).r;
+    return normalize(float2(dx,dy));
+}
+
+float2 CalculateDensity(float2 pos)
+{
+    float density = 0;
+    float nearDensity = 0;
+    for (int i = -1; i <= 1; i++)
+        for (int j = -1; j <= 1; j++)
+        {
+            float x = pos.x + smoothRadius * i;
+            float y = pos.y + smoothRadius * j;
+            uint thisHash = GetHashByPos(x,y);
+            for (uint k = startIndices[thisHash]; k < particleCnt && spacialHash[spacialHashKeys[k]].x == thisHash; k++)
+            {
+                uint ii = spacialHash[spacialHashKeys[k]].y;
+                if (isLiquidHidden[ii]) continue;
+                float2 pos2 = predictions[ii];
+                float dst = distance(pos, pos2);
+                float w = SmoothKernel(dst);
+                density += w;
+                nearDensity += SmoothKernelSpiky(dst);
+            }
+        }
+    return float2(density, nearDensity);
+}
+
+#pragma kernel CalculateDensities
+[numthreads(64,1,1)]
+void CalculateDensities (uint3 id: SV_DispatchThreadID)
+{
+    uint i = id.x;
+    densities[i] = CalculateDensity(predictions[i]);
+    float2 uv = predictions[i]/float2(width,height);
+    //densities[i].x += min(densities[i].x,densityMapTex.SampleLevel(sampler_LinearClamp, uv, 0).x);
+}
+
+float ViscosityKernel(float dst)
+{
+    if (dst >= smoothRadius) return 0.0;
+    float val = pow(smoothRadius*smoothRadius-dst*dst, 3)*_vKernel;
+    return val;
+}
+
+float SmoothKernelDerivative(float dst)
+{
+    if (dst >= smoothRadius) return 0.0;
+    float val = (dst-smoothRadius)*_sKernelDerivative;
+    return val;
+}
+
+float SmoothKernelSpikyDerivative(float dst)
+{
+    if (dst >= smoothRadius) return 0.0;
+    float val = -(dst-smoothRadius)*(dst-smoothRadius)*_sKernelSpikyDerivative;
+    return val;
+}
+
+float DensityToPressure(float density)
+{
+    float pressure = 0.0;
+    pressure += (density - targetDensity) * pressureMultiplier;
+    return pressure;
+}
+
+float SharedPressure(float a, float b)
+{
+    float pa = DensityToPressure(a);
+    float pb = DensityToPressure(b);
+    return (pa + pb) / 2.0;
+}
+
+float2 GetViscosityForce(uint particleIndex)
+{
+    if (viscosity == 0 || isLiquidHidden[particleIndex]) return float2(0,0);
+    float2 viscosityForce = float2(0,0);
+    float2 pos = predictions[particleIndex];
+       
+    for (int i = -1; i <= 1; i++)
+        for (int j = -1; j <= 1; j++)
+        {
+            float x = pos.x + smoothRadius * i;
+            float y = pos.y + smoothRadius * j;
+            uint thisHash = GetHashByPos(x,y);
+            for (uint k = startIndices[thisHash]; k < particleCnt && spacialHash[spacialHashKeys[k]].x == thisHash; k++)
+            {
+                uint ii = spacialHash[spacialHashKeys[k]].y;
+                if (isLiquidHidden[ii]) continue;
+                float dst = distance(pos, predictions[ii]);
+                float influence = ViscosityKernel(dst);
+                viscosityForce += influence * (velocities[ii] - velocities[particleIndex]);
+            }
+        }
+    return viscosityForce*viscosity;
+}
+
+float2 CalculatePressure(uint index)
+{
+    if (isLiquidHidden[index]) return float2(0,0);
+    float2 gradient=float2(0,0);
+    float2 pos = predictions[index];
+    float2 velDif = 0;
+    for (int i = -1; i <= 1; i++)
+        for (int j = -1; j <= 1; j++)
+        {
+            float x = pos.x + smoothRadius * i;
+            float y = pos.y + smoothRadius * j;
+            uint thisHash = GetHashByPos(x,y);
+            for (uint k = startIndices[thisHash]; k < particleCnt && spacialHash[spacialHashKeys[k]].x == thisHash; k++)
+            {
+                uint ii = spacialHash[spacialHashKeys[k]].y;
+                if (isLiquidHidden[ii]) continue;
+                if (ii == index) continue;
+                float2 dir = predictions[index] - predictions[ii];
+                float dst = sqrt(dir.x*dir.x + dir.y*dir.y);
+                if (dst < 0.001f) dst = 0.001f;
+                float2 dirNorm = dir / dst;
+                float slope = SmoothKernelDerivative(dst);
+                float sharedPressure = SharedPressure(densities[index].x, densities[ii].x);
+                
+                gradient += dirNorm * (sharedPressure * slope)/densities[ii].x;
+                float nearSlope = SmoothKernelSpikyDerivative(dst);
+                float nearSharedPressure =(densities[index].y*nearDensityMultiplier+densities[ii].y*nearDensityMultiplier)/2.0;
+                gradient += dirNorm * (nearSharedPressure * nearSlope)/densities[ii].y;
+                
+                velDif += abs(velocities[index]-velocities[ii])*SmoothKernel(dst);
+            }
+        }
+    float foamRatio = min(1,(velDif.x+velDif.y)/foamVelocity);
+    foamFactors[index] = foamRatio;
+    /*float2 uv = pos/float2(width,height);
+    if (densityMapTex.SampleLevel(sampler_LinearClamp, uv, 0).x > 0)
+    {
+        gradient += densityMapTex.SampleLevel(sampler_LinearClamp, uv, 0).yz*pressureMultiplier;
+    }*/
+    return -gradient;
+}
+
+#pragma kernel CalculateVelocities
+[numthreads(64,1,1)]
+void CalculateVelocities (uint3 id: SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (isLiquidHidden[i]) return;
+    //if (i < boundaryParticleCnt) return;
+    //velocities[i].x *= 0.1f;
+    //velocities[i].y *= 0.98f;
+    velocities[i] += ((CalculatePressure(i)+GetViscosityForce(i))/densities[i]) * delta;
+    /*velocities[i] += CalculateSimpleDEMForce(i) * delta;
+    velocities[i].y *= 0.98f;
+    velocities[i].x *= 0.9f;
+    if (length(velocities[i]) <0.05f)
+    {
+        velocities[i] = 0.0f;
+    } */
+}
+
+void ResolveCollisions(uint i)
+{
+    float2 pos = positions[i];
+    if (pos.y < 0)
+    {
+        positions[i].y = 0;
+        velocities[i].y *= -1 * damping;
+        //velocities[i].x *= 0.2f;
+    }
+    else if (pos.y > height)
+    {
+        positions[i].y = height;
+        velocities[i].y *= -1 * damping;
+    }
+
+    if (pos.x < 0) 
+    {
+        positions[i].x = 0;
+        velocities[i].x *= -1 * damping;
+    }
+
+    else if (pos.x > width)
+    {
+        positions[i].x = width;
+        velocities[i].x *= -1 * damping;
+    }
+
+    float2 obsDist = obstacleSize - abs(pos - obstaclePos);
+    if (obsDist.x >= 0 && obsDist.y >= 0)
+    {
+        if (obsDist.x < obsDist.y)
+        {
+            positions[i].x = obstacleSize.x * sign(pos.x-obstaclePos.x) + obstaclePos.x;
+            velocities[i].x *= -1 * damping;
+        }
+        else
+        {
+            positions[i].y = obstacleSize.y * sign(pos.y-obstaclePos.y) + obstaclePos.y;
+            velocities[i].y *= -1 * damping;
+        }
+    }
+
+    float2 size = float2(width, height);
+    float2 uv = pos/size;
+    //in a wall
+    float dist = boundaryTexture.SampleLevel(sampler_LinearClamp, uv, 0).r - 0.003125;
+    if (dist < 0)
+    {
+        float2 normal = SDFGradient(uv);
+        pos -= normal * dist*size;
+        
+        positions[i] -= normal * dist*size*1;
+        float2 vn = dot(velocities[i], normal) * normal;
+        float2 vt = velocities[i] - vn;
+        velocities[i] -= vn * (1.1f);
+        velocities[i] -= vt * 0.2f;
+        
+    }
+}
+
+#pragma kernel UpdatePositions
+[numthreads(64,1,1)]
+void UpdatePositions (uint3 id: SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (isLiquidHidden[i]) return;
+    if (i < boundaryParticleCnt)
+    {
+        return;
+    }
+    positions[i] += velocities[i]*delta;
+    ResolveCollisions(i);
+}
+
+#pragma kernel UpdateHash
+[numthreads(64,1,1)]
+void UpdateHash (uint3 id: SV_DispatchThreadID)
+{
+    uint i = id.x;
+    float x = predictions[i].x, y = predictions[i].y;
+    spacialHash[i] = uint2(GetHashByPos(x,y), i);
+    spacialHashKeys[i] = i;
+}
+
+#pragma kernel ResetIndices
+[numthreads(64,1,1)]
+void ResetIndices (uint3 id: SV_DispatchThreadID)
+{
+    uint i = id.x;
+    startIndices[i] = particleCnt+1000;
+}
+
+#pragma kernel CalcIndices
+[numthreads(64,1,1)]
+void CalcIndices (uint3 id: SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i == 0 || spacialHash[spacialHashKeys[i]].x != spacialHash[spacialHashKeys[i-1]].x)
+        startIndices[spacialHash[spacialHashKeys[i]].x] = i;
+}
+
+#pragma kernel SampleDensityMap
+[numthreads(8,8,1)]
+void SampleDensityMap (uint2 id: SV_DispatchThreadID)
+{
+    float2 pos = (float2)id*boundaryParticleDist;
+    if (pos.x > width || pos.y > height) return;
+    float2 uv = pos/float2(width,height);
+    int2 pixel = uv*boundaryTextureSize;
+    
+    
+    float density = 0;
+    uint nearestParticle = 0;
+    float nearestDist = 100000;
+    for (int i = -1; i <= 1; i++)
+        for (int j = -1; j <= 1; j++)
+        {
+            float x = pos.x + smoothRadius * i;
+            float y = pos.y + smoothRadius * j;
+            uint thisHash = GetHashByPos(x,y);
+            for (uint k = startIndices[thisHash]; k < particleCnt && spacialHash[spacialHashKeys[k]].x == thisHash; k++)
+            {
+                uint ii = spacialHash[spacialHashKeys[k]].y;
+                if (isLiquidHidden[ii]) continue;
+                float2 pos2 = predictions[ii];
+                float dst = distance(pos, pos2);
+                if (dst < nearestDist)
+                {
+                    nearestDist = dst;
+                    nearestParticle = ii;
+                }
+                float w = SmoothKernel(dst);
+                density += w;
+            }
+        }
+    float densityRatio = density/targetDensity;
+    if (densityRatio >= 0.7)
+    {
+        float2 nearestPos = predictions[nearestParticle];
+        float2 velDif = 0;
+        //velocity diff
+        for (int i = -1; i <= 1; i++)
+            for (int j = -1; j <= 1; j++)
+            {
+                float x = pos.x + smoothRadius * i;
+                float y = pos.y + smoothRadius * j;
+                uint thisHash = GetHashByPos(x,y);
+                for (uint k = startIndices[thisHash]; k < particleCnt && spacialHash[spacialHashKeys[k]].x == thisHash; k++)
+                {
+                    uint ii = spacialHash[spacialHashKeys[k]].y;
+                    if (isLiquidHidden[ii]) continue;
+                    float2 pos2 = predictions[ii];
+                    float dst = distance(nearestPos, pos2);
+                    float w = SmoothKernel(dst);
+                    if (isnan(velocities[ii].x)||isnan(velocities[ii].y)) continue;
+                    velDif += abs(velocities[nearestParticle]-velocities[ii])*w;
+                }
+            }
+        float foamRatio = min(1,(velDif.x+velDif.y)/foamVelocity);
+        foamRatio *= foamRatio;
+        //foamRatio = floor(foamRatio*5.0)/5.0;
+        //if (foamRatio <= 0.3) foamRatio = 0;
+        fluidDensityMap[pixel]=densityRatio < 0.7 ? 0 : lerp(float4(0.05,0.53,0.8,.1), float4(1,1,1,1), foamRatio);
+    }
+    else
+    {
+        fluidDensityMap[pixel] = float4(0,0,0,0);
+    }
+    /*density = 0;
+    float2 gradient = 0;
+    float dv = boundaryParticleDist * boundaryParticleDist;
+    for (float x = pos.x - smoothRadius/2; x <= pos.x + smoothRadius/2; x += boundaryParticleDist)
+        for (float y = pos.y - smoothRadius/2; y <= pos.y + smoothRadius/2; y += boundaryParticleDist)
+        {
+            float2 uv = float2(x,y)/float2(width,height);
+            float c = boundaryTexture.SampleLevel(sampler_LinearClamp, uv, 0).r;
+            if (c < 0)
+            {
+                float2 dir = pos - float2(x,y);
+                float dst = length(dir);
+                density += SmoothKernel(dst)*targetDensity*dv;
+                if (dst < 0.001f) continue;
+                float2 dirNorm = dir / dst;
+                float slope = SmoothKernelDerivative(dst);
+                gradient += dirNorm * slope*targetDensity*dv;
+            }
+        }
+    densityMap[pixel] = float3(density, gradient);*/
+}
