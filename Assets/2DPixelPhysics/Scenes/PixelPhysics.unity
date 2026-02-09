@@ -429,7 +429,7 @@ MonoBehaviour:
   pressureMultiplier: 500
   particleCnt: 2048
   mouseForceStrength: 20
-  mouseForceRadius: 5
+  mouseForceRadius: 3
   viscosity: 0
   nearDensityMultiplier: 10
   obstacleSize:
@@ -820,7 +820,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &1825928853
 MonoBehaviour:
   m_ObjectHideFlags: 0
